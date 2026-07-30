@@ -1,3 +1,5 @@
 python-telegram-bot>=20.0
 requests
 redis
+cloudscraper
+PyNaCl
