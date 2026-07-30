@@ -26,7 +26,7 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-# --- غیرفعال‌سازی هشدارهای امنیتی SSL (مشابه نسخه دوم) ---
+# --- غیرفعال‌سازی هشدارهای امنیتی SSL ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- لاگ‌ها ---
@@ -88,7 +88,7 @@ def seal_data_with_sodium(data_dict: dict) -> str:
     return base64.b64encode(sealed_box.encrypt(json_string)).decode('utf-8')
 
 def refresh_snappfood_token_advanced(current_refresh_token: str) -> dict:
-    """دریافت توکن جدید با استفاده از متد رمزنگاری و CloudScraper (رفع باگ از نسخه دوم)"""
+    """دریافت توکن جدید با استفاده از متد رمزنگاری و CloudScraper (بدون تداخل SSL)"""
     if not server_public_key:
         return {'status': False, 'error': 'کلید رمزنگاری بارگذاری نشد'}
 
@@ -99,12 +99,9 @@ def refresh_snappfood_token_advanced(current_refresh_token: str) -> dict:
         if IRAN_PROXY:
             session.proxies.update({"http": IRAN_PROXY, "https": IRAN_PROXY})
 
-        # غیرفعال‌سازی بررسی SSL برای عبور از خطاهای پروکسی
-        session.verify = False
-
         session.headers.update({
             "x-is-bonyan": "true",
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10)", # هدر تصحیح شده مشابه نسخه سالم
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10)", 
             "Origin": "https://m.snappfood.ir"
         })
         
@@ -123,7 +120,7 @@ def refresh_snappfood_token_advanced(current_refresh_token: str) -> dict:
         
         try:
             sealed_payload = seal_data_with_sodium(grant_body)
-            # استفاده از نشست مدیریت شده برای ریکوئست
+            # کلوداسکرپر حالا به درستی و بدون ارور گواهینامه ریکوئست را ارسال می‌کند
             res = session.post(TOKEN_ENDPOINT_URL, json={"data": sealed_payload}, timeout=20)
             
             if res.status_code == 200:
