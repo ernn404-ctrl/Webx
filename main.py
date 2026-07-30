@@ -11,6 +11,7 @@ import io
 import time
 import base64
 import cloudscraper
+import urllib3
 from datetime import datetime
 from typing import Optional
 from nacl.public import PublicKey, SealedBox
@@ -24,6 +25,9 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
+
+# --- غیرفعال‌سازی هشدارهای امنیتی SSL (مشابه نسخه دوم) ---
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- لاگ‌ها ---
 logging.basicConfig(
@@ -65,7 +69,7 @@ BASE_HEADERS = {
     'content-type': 'application/json',
     'origin': 'https://snappfood.ir',
     'referer': 'https://snappfood.ir/',
-    'user-agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36'
+    'user-agent': 'Mozilla/5.0 (Linux; Android 10)'
 }
 
 # ================= سیستم رمزنگاری و بای‌پَس پیشرفته اسنپ‌فود =================
@@ -84,53 +88,57 @@ def seal_data_with_sodium(data_dict: dict) -> str:
     return base64.b64encode(sealed_box.encrypt(json_string)).decode('utf-8')
 
 def refresh_snappfood_token_advanced(current_refresh_token: str) -> dict:
-    """دریافت توکن جدید با استفاده از متد رمزنگاری و CloudScraper (دور زدن کلودفلر)"""
+    """دریافت توکن جدید با استفاده از متد رمزنگاری و CloudScraper (رفع باگ از نسخه دوم)"""
     if not server_public_key:
         return {'status': False, 'error': 'کلید رمزنگاری بارگذاری نشد'}
 
     scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'android', 'desktop': False})
     
-    # اعمال پروکسی ایران برای اسکرپر
-    if IRAN_PROXY:
-        scraper.proxies.update({"http": IRAN_PROXY, "https": IRAN_PROXY})
+    with scraper as session:
+        # اعمال پروکسی در صورت وجود
+        if IRAN_PROXY:
+            session.proxies.update({"http": IRAN_PROXY, "https": IRAN_PROXY})
 
-    scraper.headers.update({
-        "x-is-bonyan": "true",
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36",
-        "Origin": "https://m.snappfood.ir"
-    })
-    
-    device_uid = str(uuid.uuid4())
-    grant_body = {
-        "time": int(time.time()),
-        "device_uid": device_uid,
-        "client_id": "snappfood_pwa",
-        "client_secret": "snappfood_pwa_secret",
-        "scopes": ["mobile_v2", "mobile_v1", "webview"],
-        "grant_type": "refresh_token",
-        "refresh_token": current_refresh_token
-    }
-    
-    TOKEN_ENDPOINT_URL = "https://snappfood.ir/oauth2/default/token"
-    
-    try:
-        sealed_payload = seal_data_with_sodium(grant_body)
-        res = scraper.post(TOKEN_ENDPOINT_URL, json={"data": sealed_payload}, timeout=20)
+        # غیرفعال‌سازی بررسی SSL برای عبور از خطاهای پروکسی
+        session.verify = False
+
+        session.headers.update({
+            "x-is-bonyan": "true",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10)", # هدر تصحیح شده مشابه نسخه سالم
+            "Origin": "https://m.snappfood.ir"
+        })
         
-        if res.status_code == 200:
-            data = res.json().get("data", {})
-            # نرمال‌سازی کلیدها برای سازگاری با بقیه کد ربات
-            return {
-                'status': True,
-                'data': {
-                    'accessToken': data.get("access_token") or data.get("accessToken"),
-                    'refreshToken': data.get("refresh_token") or data.get("refreshToken") or current_refresh_token
+        device_uid = str(uuid.uuid4())
+        grant_body = {
+            "time": int(time.time()),
+            "device_uid": device_uid,
+            "client_id": "snappfood_pwa",
+            "client_secret": "snappfood_pwa_secret",
+            "scopes": ["mobile_v2", "mobile_v1", "webview"],
+            "grant_type": "refresh_token",
+            "refresh_token": current_refresh_token
+        }
+        
+        TOKEN_ENDPOINT_URL = "https://snappfood.ir/oauth2/default/token"
+        
+        try:
+            sealed_payload = seal_data_with_sodium(grant_body)
+            # استفاده از نشست مدیریت شده برای ریکوئست
+            res = session.post(TOKEN_ENDPOINT_URL, json={"data": sealed_payload}, timeout=20)
+            
+            if res.status_code == 200:
+                data = res.json().get("data", {})
+                return {
+                    'status': True,
+                    'data': {
+                        'accessToken': data.get("access_token") or data.get("accessToken"),
+                        'refreshToken': data.get("refresh_token") or data.get("refreshToken") or current_refresh_token
+                    }
                 }
-            }
-        return {'status': False, 'error': f"HTTP {res.status_code}"}
-    except Exception as e:
-        logger.error(f"خطای پیشرفته در ریفرش توکن: {e}")
-        return {'status': False, 'error': str(e)}
+            return {'status': False, 'error': f"HTTP {res.status_code} - {res.text}"}
+        except Exception as e:
+            logger.error(f"خطای پیشرفته در ریفرش توکن: {e}")
+            return {'status': False, 'error': str(e)}
 # ==============================================================================
 
 # --- توابع API معمولی (برای ورود اولیه) ---
@@ -138,7 +146,8 @@ def send_verification_code(phone_number: str) -> dict:
     url = "https://user.snappfood.ir/v1/auth/otp/send"
     payload = {"mobile_number": phone_number, "type": "Customer"}
     try:
-        response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, timeout=15)
+        # اضافه شدن verify=False برای جلوگیری از خطای پروکسی
+        response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, verify=False, timeout=15)
         if response.status_code == 200: return response.json()
         return {'status': False, 'error': f"HTTP {response.status_code}"}
     except Exception as e:
@@ -155,14 +164,15 @@ def verify_code(phone_number: str, code: str) -> dict:
         }
     }
     try:
-        response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, timeout=15)
+        # اضافه شدن verify=False
+        response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, verify=False, timeout=15)
         data = response.json()
         if not (data.get('status') or data.get('success')) and 'accessToken' not in data.get('data', {}):
             first_names = ["علی", "محمد", "یوسف", "امیر", "حسین", "رضا", "مهدی"]
             last_names = ["راد", "تهرانی", "حسینی", "پارسا", "دانش", "آریا"]
             payload["firstName"] = random.choice(first_names)
             payload["lastName"] = random.choice(last_names)
-            response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, timeout=15)
+            response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, verify=False, timeout=15)
             data = response.json()
         return data
     except Exception as e:
@@ -175,6 +185,7 @@ async def shorten_url_shortio(long_url: str, domain: str, api_key: str, phone_nu
     payload = {"originalURL": long_url, "domain": domain, "path": custom_path}
     headers = {"accept": "application/json", "content-type": "application/json", "Authorization": api_key}
     try:
+        # نیازی به پروکسی و verify=False برای shortio نیست
         response = await asyncio.to_thread(requests.post, api_url, json=payload, headers=headers, timeout=10)
         if response.status_code in [400, 409]:
             payload["path"] = f"{custom_path}-{random.randint(10, 999)}"
@@ -193,7 +204,6 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     elif update.message:
         await update.message.reply_text("🚫 عملیات لغو شد.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
-
 
 # --- وضعیت‌های مکالمه ---
 ASK_PHONE, ASK_CODE, ASK_NEXT_ACTION = range(3)
