@@ -8,8 +8,12 @@ import uuid
 import asyncio
 import redis
 import io
+import time
+import base64
+import cloudscraper
 from datetime import datetime
 from typing import Optional
+from nacl.public import PublicKey, SealedBox
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -35,7 +39,6 @@ ALLOWED_USER_IDS = [int(x.strip()) for x in allowed_users_env.split(",") if x.st
 SHORTIO_API_KEY_EXPRESS = os.getenv("SHORTIO_API_KEY_EXPRESS")
 SHORTIO_DOMAIN_EXPRESS = os.getenv("SHORTIO_DOMAIN_EXPRESS")
 LINK_CUSTOM_PREFIX = os.getenv("LINK_CUSTOM_PREFIX", "market")
-
 REDIS_URL = os.getenv("REDIS_URL")
 
 IRAN_PROXY = os.getenv("IRAN_PROXY", "http://6f05828d954209c18b50__cr.ir:93cc122d6b59f8d8@gw.dataimpulse.com:823")
@@ -65,65 +68,103 @@ BASE_HEADERS = {
     'user-agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36'
 }
 
-# --- توابع API ---
+# ================= سیستم رمزنگاری و بای‌پَس پیشرفته اسنپ‌فود =================
+SERVER_PUBLIC_KEY_B64 = "eUhcujcdUs07+XAa6jPweavHMp26he6HCfowMUlaI08="
+try:
+    server_public_key_bytes = base64.b64decode(SERVER_PUBLIC_KEY_B64)
+    server_public_key = PublicKey(server_public_key_bytes)
+except Exception as e:
+    logger.error(f"🔴 خطای رمزنگاری کلید عمومی: {e}")
+    server_public_key = None
+
+def seal_data_with_sodium(data_dict: dict) -> str:
+    """رمزنگاری بدنه درخواست دقیقاً مشابه اپلیکیشن موبایل اسنپ‌فود"""
+    json_string = json.dumps(data_dict).encode('utf-8')
+    sealed_box = SealedBox(server_public_key)
+    return base64.b64encode(sealed_box.encrypt(json_string)).decode('utf-8')
+
+def refresh_snappfood_token_advanced(current_refresh_token: str) -> dict:
+    """دریافت توکن جدید با استفاده از متد رمزنگاری و CloudScraper (دور زدن کلودفلر)"""
+    if not server_public_key:
+        return {'status': False, 'error': 'کلید رمزنگاری بارگذاری نشد'}
+
+    scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'android', 'desktop': False})
+    
+    # اعمال پروکسی ایران برای اسکرپر
+    if IRAN_PROXY:
+        scraper.proxies.update({"http": IRAN_PROXY, "https": IRAN_PROXY})
+
+    scraper.headers.update({
+        "x-is-bonyan": "true",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36",
+        "Origin": "https://m.snappfood.ir"
+    })
+    
+    device_uid = str(uuid.uuid4())
+    grant_body = {
+        "time": int(time.time()),
+        "device_uid": device_uid,
+        "client_id": "snappfood_pwa",
+        "client_secret": "snappfood_pwa_secret",
+        "scopes": ["mobile_v2", "mobile_v1", "webview"],
+        "grant_type": "refresh_token",
+        "refresh_token": current_refresh_token
+    }
+    
+    TOKEN_ENDPOINT_URL = "https://snappfood.ir/oauth2/default/token"
+    
+    try:
+        sealed_payload = seal_data_with_sodium(grant_body)
+        res = scraper.post(TOKEN_ENDPOINT_URL, json={"data": sealed_payload}, timeout=20)
+        
+        if res.status_code == 200:
+            data = res.json().get("data", {})
+            # نرمال‌سازی کلیدها برای سازگاری با بقیه کد ربات
+            return {
+                'status': True,
+                'data': {
+                    'accessToken': data.get("access_token") or data.get("accessToken"),
+                    'refreshToken': data.get("refresh_token") or data.get("refreshToken") or current_refresh_token
+                }
+            }
+        return {'status': False, 'error': f"HTTP {res.status_code}"}
+    except Exception as e:
+        logger.error(f"خطای پیشرفته در ریفرش توکن: {e}")
+        return {'status': False, 'error': str(e)}
+# ==============================================================================
+
+# --- توابع API معمولی (برای ورود اولیه) ---
 def send_verification_code(phone_number: str) -> dict:
     url = "https://user.snappfood.ir/v1/auth/otp/send"
     payload = {"mobile_number": phone_number, "type": "Customer"}
     try:
         response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, timeout=15)
-        if response.status_code == 200:
-            return response.json()
+        if response.status_code == 200: return response.json()
         return {'status': False, 'error': f"HTTP {response.status_code}"}
     except Exception as e:
-        logger.error(f"خطا در ارسال کد: {e}")
         return {'status': False, 'error': str(e)}
 
 def verify_code(phone_number: str, code: str) -> dict:
     url = "https://user.snappfood.ir/v1/auth/token"
     payload = {
-        "cellphone": phone_number,
-        "otpCode": int(code),
-        "grantType": "Otp",
+        "cellphone": phone_number, "otpCode": int(code), "grantType": "Otp",
         "data": {
-            "time": int(datetime.now().timestamp()),
-            "device_uid": str(uuid.uuid4()),
-            "client_id": "snappfood_pwa",
-            "client_secret": "snappfood_pwa_secret",
+            "time": int(datetime.now().timestamp()), "device_uid": str(uuid.uuid4()),
+            "client_id": "snappfood_pwa", "client_secret": "snappfood_pwa_secret",
             "scopes": ["mobile_v2", "mobile_v1", "webview"]
         }
     }
     try:
         response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, timeout=15)
         data = response.json()
-        # رفع باگ: بررسی وضعیت‌های مختلف پاسخ سرور
         if not (data.get('status') or data.get('success')) and 'accessToken' not in data.get('data', {}):
-            first_names = ["علی", "محمد", "یوسف", "امیر", "حسین", "رضا", "مهدی", "سارا", "زهرا", "مریم"]
-            last_names = ["راد", "تهرانی", "حسینی", "پارسا", "دانش", "آریا", "کریمی", "احمدی", "رضایی"]
+            first_names = ["علی", "محمد", "یوسف", "امیر", "حسین", "رضا", "مهدی"]
+            last_names = ["راد", "تهرانی", "حسینی", "پارسا", "دانش", "آریا"]
             payload["firstName"] = random.choice(first_names)
             payload["lastName"] = random.choice(last_names)
             response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, timeout=15)
             data = response.json()
         return data
-    except Exception as e:
-        return {'status': False, 'error': str(e)}
-
-def refresh_snappfood_token(phone_number: str, refresh_token: str) -> dict:
-    url = "https://user.snappfood.ir/v1/auth/token"
-    payload = {
-        "cellphone": phone_number,
-        "grantType": "RefreshToken",
-        "refreshToken": refresh_token,
-        "data": {
-            "client_id": "snappfood_pwa",
-            "client_secret": "snappfood_pwa_secret",
-            "device_uid": str(uuid.uuid4())
-        }
-    }
-    try:
-        response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, timeout=15)
-        if response.status_code == 200:
-            return response.json()
-        return {'status': False, 'error': f"HTTP {response.status_code}"}
     except Exception as e:
         return {'status': False, 'error': str(e)}
 
@@ -136,15 +177,14 @@ async def shorten_url_shortio(long_url: str, domain: str, api_key: str, phone_nu
     try:
         response = await asyncio.to_thread(requests.post, api_url, json=payload, headers=headers, timeout=10)
         if response.status_code in [400, 409]:
-            payload["path"] = f"{custom_path}-{random.randint(10, 99)}"
+            payload["path"] = f"{custom_path}-{random.randint(10, 999)}"
             response = await asyncio.to_thread(requests.post, api_url, json=payload, headers=headers, timeout=10)
         response.raise_for_status()
         return response.json().get("shortURL")
     except Exception:
         return None
 
-
-# --- تابع جامع برای لغو عملیات (پشتیبانی از دستور متنی و دکمه شیشه‌ای) ---
+# --- تابع لغو ---
 async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     if update.callback_query:
@@ -182,7 +222,6 @@ async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     res = await asyncio.to_thread(send_verification_code, phone_number)
     
-    # شناسایی پاسخ موفق چه با status و چه با success
     if res.get('status') or res.get('success'):
         keyboard = [
             [InlineKeyboardButton("🔄 ارسال مجدد کد", callback_data='resend_code'),
@@ -218,7 +257,6 @@ async def ask_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     res = await asyncio.to_thread(verify_code, phone_number, code)
     
-    # استخراج امن اطلاعات
     data_dict = res.get('data', {})
     access_token = data_dict.get('accessToken')
     refresh_token = data_dict.get('refreshToken')
@@ -294,7 +332,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("📊 آمار دیتابیس", callback_data='admin_stats'),
-         InlineKeyboardButton("🔄 بازسازی لینک‌ها", callback_data='admin_rebuild')],
+         InlineKeyboardButton("🔄 بازسازی لینک‌ها (پیشرفته)", callback_data='admin_rebuild')],
         [InlineKeyboardButton("📥 استخراج فایل بکاپ", callback_data='admin_extract')]
     ]
     await update.message.reply_text(
@@ -315,21 +353,24 @@ async def delete_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ این شماره در دیتابیس پیدا نشد.")
 
 async def process_database_rebuild(chat_id: int, bot):
+    """فرآیند بازسازی با استفاده از سیستم پیشرفته رمزنگاری در پس‌زمینه"""
     if not redis_client: return
     keys = redis_client.keys("snappfood:token:*")
     success_count, fail_count = 0, 0
-    await bot.send_message(chat_id=chat_id, text=f"⏳ عملیات بازسازی برای `{len(keys)}` رکورد آغاز شد...\n(ربات قفل نیست!)", parse_mode='Markdown')
+    await bot.send_message(chat_id=chat_id, text=f"⏳ عملیات بازسازی ایمن برای `{len(keys)}` رکورد آغاز شد...\n(درحال دور زدن کلودفلر و ایجاد توکن‌های جدید)", parse_mode='Markdown')
     
     for key in keys:
         try:
             data = json.loads(redis_client.get(key))
             phone = data.get("phone_number")
             r_token = data.get("refresh_token")
+            
             if not phone or not r_token:
                 fail_count += 1
                 continue
                 
-            res = await asyncio.to_thread(refresh_snappfood_token, phone, r_token)
+            # --- فراخوانی تابع فوق‌پیشرفته جدید ---
+            res = await asyncio.to_thread(refresh_snappfood_token_advanced, r_token)
             
             new_data_dict = res.get('data', {})
             new_access = new_data_dict.get('accessToken')
@@ -350,13 +391,15 @@ async def process_database_rebuild(chat_id: int, bot):
                 fail_count += 1
         except Exception:
             fail_count += 1
-        await asyncio.sleep(1)
+            
+        # وقفه حیاتی برای شبیه‌سازی رفتار انسان و جلوگیری از مسدودی
+        await asyncio.sleep(2)
         
     msg = (
-        f"✅ **عملیات بازسازی پایان یافت!**\n\n"
+        f"✅ **عملیات بازسازی پیشرفته پایان یافت!**\n\n"
         f"📊 مجموع اکانت‌ها: `{len(keys)}`\n"
         f"🟢 موفق و بروزشده: `{success_count}`\n"
-        f"🔴 ناموفق (منقضی شده): `{fail_count}`\n\n"
+        f"🔴 ناموفق (منقضی یا مسدود): `{fail_count}`\n\n"
         f"💡 حالا می‌توانید یک بکاپ جدید بگیرید."
     )
     await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
@@ -391,7 +434,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == 'admin_back':
         keyboard = [
             [InlineKeyboardButton("📊 آمار دیتابیس", callback_data='admin_stats'),
-             InlineKeyboardButton("🔄 بازسازی لینک‌ها", callback_data='admin_rebuild')],
+             InlineKeyboardButton("🔄 بازسازی لینک‌ها (پیشرفته)", callback_data='admin_rebuild')],
             [InlineKeyboardButton("📥 استخراج فایل بکاپ", callback_data='admin_extract')]
         ]
         await query.edit_message_text("⚙️ **پنل مدیریت پیشرفته ربات**\n\nلطفاً یک گزینه را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -425,7 +468,7 @@ def main() -> None:
     application.add_handler(CommandHandler("delete", delete_number))
     application.add_handler(CallbackQueryHandler(admin_callbacks, pattern="^admin_"))
     
-    logger.info("🤖 نسخه جدید و دیباگ‌شده روشن شد...")
+    logger.info("🤖 مکانیزم رمزنگاری فعال شد و ربات در حال اجراست...")
     application.run_polling()
 
 if __name__ == "__main__":
