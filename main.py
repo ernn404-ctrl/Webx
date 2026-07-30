@@ -10,7 +10,7 @@ import redis
 import io
 from datetime import datetime
 from typing import Optional
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -71,11 +71,12 @@ def send_verification_code(phone_number: str) -> dict:
     payload = {"mobile_number": phone_number, "type": "Customer"}
     try:
         response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, timeout=15)
-        response.raise_for_status()
-        return response.json()
+        if response.status_code == 200:
+            return response.json()
+        return {'status': False, 'error': f"HTTP {response.status_code}"}
     except Exception as e:
         logger.error(f"خطا در ارسال کد: {e}")
-        return {'success': False, 'error': str(e)}
+        return {'status': False, 'error': str(e)}
 
 def verify_code(phone_number: str, code: str) -> dict:
     url = "https://user.snappfood.ir/v1/auth/token"
@@ -94,7 +95,8 @@ def verify_code(phone_number: str, code: str) -> dict:
     try:
         response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, timeout=15)
         data = response.json()
-        if not data.get('success'):
+        # رفع باگ: بررسی وضعیت‌های مختلف پاسخ سرور
+        if not (data.get('status') or data.get('success')) and 'accessToken' not in data.get('data', {}):
             first_names = ["علی", "محمد", "یوسف", "امیر", "حسین", "رضا", "مهدی", "سارا", "زهرا", "مریم"]
             last_names = ["راد", "تهرانی", "حسینی", "پارسا", "دانش", "آریا", "کریمی", "احمدی", "رضایی"]
             payload["firstName"] = random.choice(first_names)
@@ -103,7 +105,7 @@ def verify_code(phone_number: str, code: str) -> dict:
             data = response.json()
         return data
     except Exception as e:
-        return {'success': False, 'error': str(e)}
+        return {'status': False, 'error': str(e)}
 
 def refresh_snappfood_token(phone_number: str, refresh_token: str) -> dict:
     url = "https://user.snappfood.ir/v1/auth/token"
@@ -119,9 +121,11 @@ def refresh_snappfood_token(phone_number: str, refresh_token: str) -> dict:
     }
     try:
         response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, timeout=15)
-        return response.json()
+        if response.status_code == 200:
+            return response.json()
+        return {'status': False, 'error': f"HTTP {response.status_code}"}
     except Exception as e:
-        return {'success': False, 'error': str(e)}
+        return {'status': False, 'error': str(e)}
 
 async def shorten_url_shortio(long_url: str, domain: str, api_key: str, phone_number: str) -> Optional[str]:
     if not api_key or not domain: return None
@@ -140,6 +144,17 @@ async def shorten_url_shortio(long_url: str, domain: str, api_key: str, phone_nu
         return None
 
 
+# --- تابع جامع برای لغو عملیات (پشتیبانی از دستور متنی و دکمه شیشه‌ای) ---
+async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("🚫 عملیات لغو شد.")
+    elif update.message:
+        await update.message.reply_text("🚫 عملیات لغو شد.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
 # --- وضعیت‌های مکالمه ---
 ASK_PHONE, ASK_CODE, ASK_NEXT_ACTION = range(3)
 
@@ -147,20 +162,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.message.from_user.id not in ALLOWED_USER_IDS: return ConversationHandler.END
     context.user_data['session_links'] = []
     
-    await update.message.reply_text("👋 **سلام!**\n\n📱 لطفاً شماره تلفن را وارد کنید (مثال: `09123456789`)", parse_mode='Markdown')
+    keyboard = [[InlineKeyboardButton("❌ لغو عملیات", callback_data='cancel')]]
+    await update.message.reply_text(
+        "👋 **سلام!**\n\n📱 لطفاً شماره تلفن را وارد کنید (مثال: `09123456789`)", 
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
     return ASK_PHONE
 
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     phone_number = update.message.text
     if not (phone_number.startswith("09") and len(phone_number) == 11 and phone_number.isdigit()):
-        await update.message.reply_text("⚠️ فرمت شماره نامعتبر است. مجدداً ارسال کنید.")
+        keyboard = [[InlineKeyboardButton("❌ لغو عملیات", callback_data='cancel')]]
+        await update.message.reply_text("⚠️ فرمت شماره نامعتبر است. مجدداً ارسال کنید.", reply_markup=InlineKeyboardMarkup(keyboard))
         return ASK_PHONE
         
     context.user_data['phone_number'] = phone_number
     await update.message.reply_text(f"⏳ درحال ارسال کد تأیید به `{phone_number}`...", parse_mode='Markdown')
     
     res = await asyncio.to_thread(send_verification_code, phone_number)
-    if res.get('success'):
+    
+    # شناسایی پاسخ موفق چه با status و چه با success
+    if res.get('status') or res.get('success'):
         keyboard = [
             [InlineKeyboardButton("🔄 ارسال مجدد کد", callback_data='resend_code'),
              InlineKeyboardButton("❌ لغو عملیات", callback_data='cancel')]
@@ -172,7 +195,8 @@ async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ASK_CODE
     else:
-        await update.message.reply_text("❌ خطا در ارسال کد. لطفاً مجدداً با /start تلاش کنید.")
+        err_msg = res.get('error', 'ارتباط با سرور برقرار نشد.')
+        await update.message.reply_text(f"❌ خطا در ارسال کد:\n`{err_msg}`\n\nلطفاً مجدداً با /start تلاش کنید.", parse_mode='Markdown')
         return ConversationHandler.END
 
 async def resend_code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -193,16 +217,18 @@ async def ask_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("⏳ درحال اعتبارسنجی و ایجاد لینک...")
     
     res = await asyncio.to_thread(verify_code, phone_number, code)
-    if res.get('success') and isinstance(res.get('data'), dict):
-        access_token = res['data'].get('accessToken')
-        refresh_token = res['data'].get('refreshToken')
+    
+    # استخراج امن اطلاعات
+    data_dict = res.get('data', {})
+    access_token = data_dict.get('accessToken')
+    refresh_token = data_dict.get('refreshToken')
 
-        # استفاده دقیق از اسنپ مارکت و اطمینان از قرارگیری توکن
+    if (res.get('status') or res.get('success')) and access_token:
         snapp_market_link = f"https://snapp.market/?source=jek_pwa-food&food_service_design=new&token={access_token}&sso_channel=food"
         short_link = await shorten_url_shortio(snapp_market_link, SHORTIO_DOMAIN_EXPRESS, SHORTIO_API_KEY_EXPRESS, phone_number)
         final_link = short_link if short_link else snapp_market_link
 
-        if redis_client and access_token:
+        if redis_client:
             redis_data = {
                 "phone_number": phone_number, "access_token": access_token, 
                 "refresh_token": refresh_token, "short_link": final_link,
@@ -224,12 +250,13 @@ async def ask_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ASK_NEXT_ACTION
     else:
+        err_msg = res.get('error', 'کد نامعتبر است.')
         keyboard = [
             [InlineKeyboardButton("🔄 ارسال مجدد کد", callback_data='resend_code'),
              InlineKeyboardButton("❌ لغو عملیات", callback_data='cancel')]
         ]
         await update.message.reply_text(
-            "⚠️ **کد اشتباه است یا خطایی رخ داد!**\n\nکد جدید را بفرستید یا عملیات را لغو کنید:",
+            f"⚠️ **خطا:** {err_msg}\n\nکد جدید را بفرستید یا عملیات را لغو کنید:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
@@ -239,9 +266,12 @@ async def next_line_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
+    
+    keyboard = [[InlineKeyboardButton("❌ لغو عملیات", callback_data='cancel')]]
     await context.bot.send_message(
         chat_id=query.message.chat_id, 
         text="📱 **لطفاً شماره تلفن جدید را وارد کنید:**",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
     return ASK_PHONE
@@ -257,18 +287,11 @@ async def finish_session_callback(update: Update, context: ContextTypes.DEFAULT_
     context.user_data.clear()
     return ConversationHandler.END
 
-async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("🚫 عملیات لغو شد.")
-    context.user_data.clear()
-    return ConversationHandler.END
 
 # --- پنل مدیریت ادمین ---
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ALLOWED_USER_IDS: return
     
-    # چیدمان مرتب و تمیز دکمه‌های ادمین
     keyboard = [
         [InlineKeyboardButton("📊 آمار دیتابیس", callback_data='admin_stats'),
          InlineKeyboardButton("🔄 بازسازی لینک‌ها", callback_data='admin_rebuild')],
@@ -307,15 +330,12 @@ async def process_database_rebuild(chat_id: int, bot):
                 continue
                 
             res = await asyncio.to_thread(refresh_snappfood_token, phone, r_token)
-            if res.get("success") and isinstance(res.get("data"), dict):
-                new_access = res["data"].get("accessToken")
-                new_refresh = res["data"].get("refreshToken")
-                
-                # جلوگیری از ذخیره توکن خالی
-                if not new_access:
-                    fail_count += 1
-                    continue
-
+            
+            new_data_dict = res.get('data', {})
+            new_access = new_data_dict.get('accessToken')
+            new_refresh = new_data_dict.get('refreshToken')
+            
+            if (res.get('status') or res.get('success')) and new_access:
                 long_link = f"https://snapp.market/?source=jek_pwa-food&food_service_design=new&token={new_access}&sso_channel=food"
                 new_short = await shorten_url_shortio(long_link, SHORTIO_DOMAIN_EXPRESS, SHORTIO_API_KEY_EXPRESS, phone)
                 
@@ -330,7 +350,7 @@ async def process_database_rebuild(chat_id: int, bot):
                 fail_count += 1
         except Exception:
             fail_count += 1
-        await asyncio.sleep(1) # وقفه برای جلوگیری از بن شدن آی‌پی
+        await asyncio.sleep(1)
         
     msg = (
         f"✅ **عملیات بازسازی پایان یافت!**\n\n"
@@ -384,19 +404,20 @@ def main() -> None:
         states={
             ASK_PHONE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone),
-                CallbackQueryHandler(cancel_callback, pattern='^cancel$')
+                CallbackQueryHandler(cancel_action, pattern='^cancel$')
             ],
             ASK_CODE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_code),
                 CallbackQueryHandler(resend_code_callback, pattern='^resend_code$'),
-                CallbackQueryHandler(cancel_callback, pattern='^cancel$')
+                CallbackQueryHandler(cancel_action, pattern='^cancel$')
             ],
             ASK_NEXT_ACTION: [
                 CallbackQueryHandler(next_line_callback, pattern='^next_line$'),
-                CallbackQueryHandler(finish_session_callback, pattern='^finish_session$')
+                CallbackQueryHandler(finish_session_callback, pattern='^finish_session$'),
+                CallbackQueryHandler(cancel_action, pattern='^cancel$')
             ]
         },
-        fallbacks=[CommandHandler("cancel", cancel_callback)],
+        fallbacks=[CommandHandler("cancel", cancel_action)],
     )
     
     application.add_handler(conv_handler)
@@ -404,7 +425,7 @@ def main() -> None:
     application.add_handler(CommandHandler("delete", delete_number))
     application.add_handler(CallbackQueryHandler(admin_callbacks, pattern="^admin_"))
     
-    logger.info("🤖 ربات با ظاهر و ساختار جدید روشن شد...")
+    logger.info("🤖 نسخه جدید و دیباگ‌شده روشن شد...")
     application.run_polling()
 
 if __name__ == "__main__":
