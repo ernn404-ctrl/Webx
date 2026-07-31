@@ -29,7 +29,7 @@ SHORTIO_DOMAIN = os.getenv("SHORTIO_DOMAIN")
 LINK_CUSTOM_PREFIX = os.getenv("LINK_CUSTOM_PREFIX", "market")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-IRAN_PROXY = os.getenv("IRAN_PROXY")
+IRAN_PROXY = "http://6f05828d954209c18b50__cr.ir:93cc122d6b59f8d8@gw.dataimpulse.com:823"
 CLIENT_ID = os.getenv("CLIENT_ID", "snappfood_pwa")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "snappfood_pwa_secret")
 
