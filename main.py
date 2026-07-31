@@ -7,15 +7,19 @@ import base64
 import time
 from datetime import datetime
 import io
-import cloudscraper
 import asyncio
 import aiohttp
+import requests
+import urllib3
 from nacl.public import PublicKey, SealedBox
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 )
 import redis.asyncio as redis_async
+
+# غیرفعال‌سازی هشدارهای SSL پروکسی
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +33,8 @@ LINK_CUSTOM_PREFIX = os.getenv("LINK_CUSTOM_PREFIX", "market")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 IRAN_PROXY = os.getenv("IRAN_PROXY", "http://6f05828d954209c18b50__cr.ir:93cc122d6b59f8d8@gw.dataimpulse.com:823")
+PROXIES = {"http": IRAN_PROXY, "https": IRAN_PROXY} if IRAN_PROXY else None
+
 CLIENT_ID = os.getenv("CLIENT_ID", "snappfood_pwa")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "snappfood_pwa_secret")
 SERVER_PUBLIC_KEY_B64 = os.getenv("SERVER_PUBLIC_KEY_B64", "eUhcujcdUs07+XAa6jPweavHMp26he6HCfowMUlaI08=")
@@ -47,13 +53,20 @@ except Exception as e:
     redis_client = None
     logger.error(f"Redis connection error: {e}")
 
+# هدرهای دقیق و شبیه‌سازی شده از روی لاگ‌های موفق شما
 BASE_HEADERS = {
     'accept': 'application/json, text/plain, */*',
     'accept-language': 'fa',
     'content-type': 'application/json',
     'origin': 'https://snappfood.ir',
     'referer': 'https://snappfood.ir/',
-    'user-agent': 'Mozilla/5.0 (Linux; Android 10)'
+    'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
+    'sec-ch-ua-mobile': '?1',
+    'sec-ch-ua-platform': '"Android"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-site',
+    'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36'
 }
 
 ASK_PHONE = 1
@@ -73,18 +86,17 @@ def seal_data_with_sodium(data_dict: dict) -> str:
 def send_verification_code_sync(phone_number: str) -> dict:
     url = "https://user.snappfood.ir/v1/auth/otp/send"
     payload = {"mobile_number": phone_number, "type": "Customer"}
-    scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'android', 'desktop': False})
-    if IRAN_PROXY:
-        scraper.proxies.update({"http": IRAN_PROXY, "https": IRAN_PROXY})
+    headers = BASE_HEADERS.copy()
+    headers['authority'] = 'user.snappfood.ir'
     
     try:
-        res = scraper.post(url, json=payload, headers=BASE_HEADERS, timeout=15)
-        raw_response = res.text
-        if res.status_code == 200:
-            return {'status': True, 'data': res.json(), 'raw': raw_response}
-        return {'status': False, 'error': f"HTTP {res.status_code}", 'raw': raw_response}
+        res = requests.post(url, json=payload, headers=headers, proxies=PROXIES, verify=False, timeout=15)
+        data = res.json() if res.status_code == 200 else {}
+        is_success = (res.status_code == 200 and data.get("success") is True)
+        error_msg = None if is_success else f"ارتباط با سرور برقرار نشد (HTTP {res.status_code})"
+        return {'success': is_success, 'error': error_msg, 'raw': res.text}
     except Exception as e:
-        return {'status': False, 'error': str(e), 'raw': str(e)}
+        return {'success': False, 'error': str(e), 'raw': str(e)}
 
 def verify_code_sync(phone_number: str, code: str) -> dict:
     url = "https://user.snappfood.ir/v1/auth/token"
@@ -96,27 +108,32 @@ def verify_code_sync(phone_number: str, code: str) -> dict:
             "scopes": ["mobile_v2", "mobile_v1", "webview"]
         }
     }
-    scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'android', 'desktop': False})
-    if IRAN_PROXY:
-        scraper.proxies.update({"http": IRAN_PROXY, "https": IRAN_PROXY})
+    headers = BASE_HEADERS.copy()
+    headers['authority'] = 'user.snappfood.ir'
 
     try:
-        res = scraper.post(url, json=payload, headers=BASE_HEADERS, timeout=15)
+        res = requests.post(url, json=payload, headers=headers, proxies=PROXIES, verify=False, timeout=15)
         raw_response = res.text
         data = res.json() if res.status_code == 200 else {}
         
-        if res.status_code != 200 or (not (data.get('status') or data.get('success')) and 'accessToken' not in data.get('data', {})):
+        has_token = 'accessToken' in data.get('data', {}) or 'access_token' in data.get('data', {})
+        
+        if res.status_code != 200 or not has_token:
             first_names = ["علی", "محمد", "یوسف", "امیر", "حسین", "رضا", "مهدی", "سارا", "زهرا", "مریم", "فاطمه", "امید", "نیما"]
             last_names = ["راد", "تهرانی", "حسینی", "پارسا", "دانش", "آریا", "رضایی", "کریمی", "احمدی", "مجیدی", "محمدی"]
             payload["firstName"] = random.choice(first_names)
             payload["lastName"] = random.choice(last_names)
-            res2 = scraper.post(url, json=payload, headers=BASE_HEADERS, timeout=15)
+            res2 = requests.post(url, json=payload, headers=headers, proxies=PROXIES, verify=False, timeout=15)
             raw_response += "\n--Retry--\n" + res2.text
             data = res2.json() if res2.status_code == 200 else {}
+            has_token = 'accessToken' in data.get('data', {}) or 'access_token' in data.get('data', {})
 
-        return {'status': res.status_code == 200 or res2.status_code == 200, 'data': data, 'raw': raw_response}
+        is_success = (res.status_code == 200 or (has_token and data.get("success") is True)) and has_token
+        error_msg = None if is_success else "کد وارد شده صحیح نمی‌باشد یا منقضی شده است."
+        
+        return {'success': is_success, 'data': data, 'error': error_msg, 'raw': raw_response}
     except Exception as e:
-        return {'status': False, 'error': str(e), 'raw': str(e)}
+        return {'success': False, 'error': str(e), 'raw': str(e)}
 
 async def shorten_url_shortio(long_url: str, phone_number: str) -> str:
     if not SHORTIO_API_KEY or not SHORTIO_DOMAIN:
@@ -144,17 +161,11 @@ async def shorten_url_shortio(long_url: str, phone_number: str) -> str:
 
 def refresh_token_sync(current_refresh_token: str) -> dict:
     if not server_public_key:
-        return {'status': False, 'error': 'Encryption key not loaded', 'raw': 'Encryption key not loaded'}
+        return {'success': False, 'error': 'Encryption key not loaded', 'raw': 'Encryption key not loaded'}
 
-    scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'android', 'desktop': False})
-    if IRAN_PROXY:
-        scraper.proxies.update({"http": IRAN_PROXY, "https": IRAN_PROXY})
-
-    scraper.headers.update({
-        "x-is-bonyan": "true",
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10)", 
-        "Origin": "https://m.snappfood.ir"
-    })
+    headers = BASE_HEADERS.copy()
+    headers['authority'] = 'snappfood.ir'
+    headers['x-is-bonyan'] = 'true'
     
     device_uid = str(uuid.uuid4())
     grant_body = {
@@ -172,23 +183,27 @@ def refresh_token_sync(current_refresh_token: str) -> dict:
     try:
         sealed_payload = seal_data_with_sodium(grant_body)
         if not sealed_payload:
-            return {'status': False, 'error': 'Encryption failed', 'raw': 'Encryption failed'}
-        res = scraper.post(TOKEN_ENDPOINT_URL, json={"data": sealed_payload}, timeout=20)
+            return {'success': False, 'error': 'Encryption failed', 'raw': 'Encryption failed'}
+            
+        res = requests.post(TOKEN_ENDPOINT_URL, json={"data": sealed_payload}, headers=headers, proxies=PROXIES, verify=False, timeout=20)
         raw_response = res.text
+        data = res.json() if res.status_code == 200 else {}
         
-        if res.status_code == 200:
-            data = res.json().get("data", {})
+        has_token = 'accessToken' in data.get('data', {}) or 'access_token' in data.get('data', {})
+        is_success = res.status_code == 200 and has_token
+        
+        if is_success:
             return {
-                'status': True,
+                'success': True,
                 'data': {
-                    'accessToken': data.get("access_token") or data.get("accessToken"),
-                    'refreshToken': data.get("refresh_token") or data.get("refreshToken") or current_refresh_token
+                    'accessToken': data['data'].get("accessToken", data['data'].get("access_token")),
+                    'refreshToken': data['data'].get("refreshToken", data['data'].get("refresh_token")) or current_refresh_token
                 },
                 'raw': raw_response
             }
-        return {'status': False, 'error': f"HTTP {res.status_code}", 'raw': raw_response}
+        return {'success': False, 'error': f"HTTP {res.status_code}", 'raw': raw_response}
     except Exception as e:
-        return {'status': False, 'error': str(e), 'raw': str(e)}
+        return {'success': False, 'error': str(e), 'raw': str(e)}
 
 def append_log(context: ContextTypes.DEFAULT_TYPE, message: str):
     if 'api_logs' not in context.user_data:
@@ -200,9 +215,9 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data.clear()
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text("عملیات لغو گردید.")
+        await update.callback_query.edit_message_text("🚫 عملیات لغو گردید.")
     else:
-        await update.message.reply_text("عملیات لغو گردید.")
+        await update.message.reply_text("🚫 عملیات لغو گردید.")
     return ConversationHandler.END
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -211,30 +226,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['session_links'] = context.user_data.get('session_links', [])
     context.user_data['api_logs'] = []
     keyboard = [[InlineKeyboardButton("لغو عملیات", callback_data='cancel')]]
-    await update.message.reply_text("شماره تلفن را وارد نمایید:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("📱 لطفاً شماره تلفن را وارد نمایید (مثال: 09123456789):", reply_markup=InlineKeyboardMarkup(keyboard))
     return ASK_PHONE
 
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     phone = update.message.text.strip()
     if not phone.isdigit() or len(phone) != 11 or not phone.startswith("09"):
-        await update.message.reply_text("فرمت شماره نامعتبر است. مجددا وارد نمایید:")
+        await update.message.reply_text("⚠️ فرمت شماره نامعتبر است. مجددا وارد نمایید:")
         return ASK_PHONE
 
-    msg = await update.message.reply_text("در حال پردازش و ارسال درخواست...")
+    msg = await update.message.reply_text("⏳ در حال پردازش و ارسال درخواست...")
     res = await asyncio.to_thread(send_verification_code_sync, phone)
     append_log(context, f"OTP Send Response for {phone}:\n{res.get('raw', '')}")
     
-    if res.get('status') and res.get('data', {}).get('status'):
+    if res.get('success'):
         context.user_data['phone'] = phone
         keyboard = [
-            [InlineKeyboardButton("ارسال مجدد کد", callback_data='resend_code'),
-             InlineKeyboardButton("لغو عملیات", callback_data='cancel')]
+            [InlineKeyboardButton("🔄 ارسال مجدد کد", callback_data='resend_code'),
+             InlineKeyboardButton("❌ لغو", callback_data='cancel')]
         ]
-        await msg.edit_text(f"کد تایید به شماره {phone} ارسال شد. کد دریافتی را وارد نمایید:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await msg.edit_text(f"✅ کد تایید به شماره `{phone}` ارسال شد. کد دریافتی را وارد نمایید:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return ASK_CODE
     else:
         keyboard = [[InlineKeyboardButton("لغو عملیات", callback_data='cancel')]]
-        await msg.edit_text(f"خطا در برقراری ارتباط:\n{res.get('error')}", reply_markup=InlineKeyboardMarkup(keyboard))
+        await msg.edit_text(f"❌ خطا در برقراری ارتباط:\n{res.get('error')}", reply_markup=InlineKeyboardMarkup(keyboard))
         return ASK_PHONE
 
 async def resend_code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -242,35 +257,35 @@ async def resend_code_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer("در حال ارسال درخواست مجدد...")
     phone = context.user_data.get('phone')
     if not phone:
-        await query.edit_message_text("شماره یافت نشد.")
+        await query.edit_message_text("⚠️ شماره یافت نشد. عملیات لغو شد.")
         return ConversationHandler.END
     
     res = await asyncio.to_thread(send_verification_code_sync, phone)
     append_log(context, f"OTP Resend Response for {phone}:\n{res.get('raw', '')}")
     
     keyboard = [
-        [InlineKeyboardButton("ارسال مجدد کد", callback_data='resend_code'),
-         InlineKeyboardButton("لغو عملیات", callback_data='cancel')]
+        [InlineKeyboardButton("🔄 ارسال مجدد کد", callback_data='resend_code'),
+         InlineKeyboardButton("❌ لغو", callback_data='cancel')]
     ]
-    if res.get('status') and res.get('data', {}).get('status'):
-        await query.edit_message_text(f"کد جدید به شماره {phone} ارسال شد. کد را وارد نمایید:", reply_markup=InlineKeyboardMarkup(keyboard))
+    if res.get('success'):
+        await query.edit_message_text(f"✅ کد جدید به شماره `{phone}` ارسال شد. کد را وارد نمایید:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     else:
-        await query.edit_message_text(f"خطا در ارسال مجدد:\n{res.get('error')}", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(f"❌ خطا در ارسال مجدد:\n{res.get('error')}", reply_markup=InlineKeyboardMarkup(keyboard))
     return ASK_CODE
 
 async def ask_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     code = update.message.text.strip()
     phone = context.user_data.get('phone')
     if not code.isdigit():
-        await update.message.reply_text("فرمت کد نامعتبر است.")
+        await update.message.reply_text("⚠️ کد باید تنها شامل اعداد باشد.")
         return ASK_CODE
         
-    msg = await update.message.reply_text("در حال تایید و ثبت اطلاعات...")
+    msg = await update.message.reply_text("⏳ در حال تایید و ثبت اطلاعات...")
     res = await asyncio.to_thread(verify_code_sync, phone, code)
     append_log(context, f"Verify Code Response for {phone}:\n{res.get('raw', '')}")
     
     data_dict = res.get('data', {})
-    if res.get('status') and 'accessToken' in data_dict.get('data', {}):
+    if res.get('success') and 'accessToken' in data_dict.get('data', {}):
         access_token = data_dict['data']['accessToken']
         refresh_token = data_dict['data']['refreshToken']
         
@@ -286,31 +301,32 @@ async def ask_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             }
             await redis_client.set(f"snappfood:token:{phone}", json.dumps(redis_data, ensure_ascii=False))
 
-        context.user_data.setdefault('session_links', []).append(f"{phone}\n{final_link}\n")
+        context.user_data.setdefault('session_links', []).append(f"📱 `{phone}`\n🔗 {final_link}\n")
 
         keyboard = [
-            [InlineKeyboardButton("افزودن رکورد جدید", callback_data='next_line')],
-            [InlineKeyboardButton("پایان عملیات و دریافت گزارش", callback_data='finish_session')]
+            [InlineKeyboardButton("➕ افزودن رکورد جدید", callback_data='next_line')],
+            [InlineKeyboardButton("✅ پایان عملیات و دریافت گزارش", callback_data='finish_session')]
         ]
         await msg.edit_text(
-            f"عملیات با موفقیت انجام شد.\nلینک مرتبط: {final_link}\nاقدام بعدی را انتخاب نمایید:",
+            f"🎉 عملیات با موفقیت انجام شد.\n🔗 لینک مرتبط: {final_link}\n\nاقدام بعدی را انتخاب نمایید:",
             reply_markup=InlineKeyboardMarkup(keyboard),
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
+            parse_mode='Markdown'
         )
         return ASK_NEXT_ACTION
     else:
         keyboard = [
-            [InlineKeyboardButton("ارسال مجدد کد", callback_data='resend_code'),
-             InlineKeyboardButton("لغو عملیات", callback_data='cancel')]
+            [InlineKeyboardButton("🔄 ارسال مجدد کد", callback_data='resend_code'),
+             InlineKeyboardButton("❌ لغو", callback_data='cancel')]
         ]
-        await msg.edit_text(f"خطا در اعتبارسنجی:\n{res.get('error', 'دسترسی غیرمجاز')}", reply_markup=InlineKeyboardMarkup(keyboard))
+        await msg.edit_text(f"❌ خطا در اعتبارسنجی:\n{res.get('error')}", reply_markup=InlineKeyboardMarkup(keyboard))
         return ASK_CODE
 
 async def next_line_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     keyboard = [[InlineKeyboardButton("لغو عملیات", callback_data='cancel')]]
-    await query.edit_message_text("شماره تلفن جدید را وارد نمایید:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text("📱 لطفاً شماره تلفن جدید را وارد نمایید:", reply_markup=InlineKeyboardMarkup(keyboard))
     return ASK_PHONE
 
 async def finish_session_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -318,8 +334,8 @@ async def finish_session_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     links = context.user_data.get('session_links', [])
     if links:
-        msg = "گزارش لینک‌های ایجاد شده:\n\n" + "\n".join(links)
-        await query.edit_message_text(text=msg, disable_web_page_preview=True)
+        msg = "📦 **گزارش لینک‌های ایجاد شده:**\n\n" + "\n".join(links)
+        await query.edit_message_text(text=msg, disable_web_page_preview=True, parse_mode='Markdown')
     else:
         await query.edit_message_text("هیچ رکوردی در این نشست ثبت نگردید.")
     
@@ -328,24 +344,24 @@ async def finish_session_callback(update: Update, context: ContextTypes.DEFAULT_
         log_content = "\n\n".join(logs)
         doc = io.BytesIO(log_content.encode('utf-8'))
         doc.name = f"Session_Logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        await context.bot.send_document(chat_id=query.message.chat_id, document=doc, caption="گزارش پاسخ‌های خام سرور (API Logs)")
+        await context.bot.send_document(chat_id=query.message.chat_id, document=doc, caption="📜 گزارش پاسخ‌های خام سرور (API Logs)")
 
     context.user_data.clear()
     return ConversationHandler.END
 
 def get_admin_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("آمار پایگاه داده", callback_data='admin_stats'),
-         InlineKeyboardButton("بازسازی توکن‌ها", callback_data='admin_rebuild')],
-        [InlineKeyboardButton("دریافت بکاپ کامل", callback_data='admin_backup_json'),
-         InlineKeyboardButton("استخراج آدرس‌ها", callback_data='admin_links_txt')],
-        [InlineKeyboardButton("حذف رکورد", callback_data='admin_delete_prompt')]
+        [InlineKeyboardButton("📊 آمار پایگاه داده", callback_data='admin_stats'),
+         InlineKeyboardButton("🔄 بازسازی توکن‌ها", callback_data='admin_rebuild')],
+        [InlineKeyboardButton("📥 دریافت فایل JSON", callback_data='admin_backup_json'),
+         InlineKeyboardButton("📋 استخراج آدرس‌ها", callback_data='admin_links_txt')],
+        [InlineKeyboardButton("🗑 حذف رکورد", callback_data='admin_delete_prompt')]
     ])
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id not in ALLOWED_USER_IDS:
         return
-    await update.message.reply_text("پنل مدیریت سیستم\nلطفا عملیات مورد نظر را انتخاب نمایید:", reply_markup=get_admin_keyboard())
+    await update.message.reply_text("⚙️ **پنل مدیریت سیستم**\nلطفا عملیات مورد نظر را انتخاب نمایید:", reply_markup=get_admin_keyboard(), parse_mode='Markdown')
 
 async def process_database_rebuild(chat_id: int, bot):
     if not redis_client:
@@ -355,7 +371,7 @@ async def process_database_rebuild(chat_id: int, bot):
         keys = await redis_client.keys("snappfood:token:*")
         success_count, fail_count = 0, 0
         log_content = ""
-        await bot.send_message(chat_id=chat_id, text=f"عملیات بازسازی برای {len(keys)} رکورد آغاز گردید.")
+        await bot.send_message(chat_id=chat_id, text=f"⏳ عملیات بازسازی برای `{len(keys)}` رکورد آغاز گردید.", parse_mode='Markdown')
         
         for key in keys:
             try:
@@ -371,7 +387,7 @@ async def process_database_rebuild(chat_id: int, bot):
                 res = await asyncio.to_thread(refresh_token_sync, r_token)
                 log_content += f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Refresh Token Response for {phone}:\n{res.get('raw', '')}\n\n"
                 
-                if res.get('status') and res.get('data', {}).get('accessToken'):
+                if res.get('success') and res.get('data', {}).get('accessToken'):
                     new_access = res['data']['accessToken']
                     new_refresh = res['data']['refreshToken']
                     
@@ -394,17 +410,17 @@ async def process_database_rebuild(chat_id: int, bot):
             await asyncio.sleep(2)
             
         msg = (
-            f"عملیات بازسازی خاتمه یافت.\n"
-            f"مجموع رکوردها: {len(keys)}\n"
-            f"بروزرسانی موفق: {success_count}\n"
-            f"عملیات ناموفق: {fail_count}"
+            f"✅ **عملیات بازسازی خاتمه یافت.**\n\n"
+            f"مجموع رکوردها: `{len(keys)}`\n"
+            f"🟢 بروزرسانی موفق: `{success_count}`\n"
+            f"🔴 عملیات ناموفق: `{fail_count}`"
         )
-        await bot.send_message(chat_id=chat_id, text=msg)
+        await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
         
         if log_content:
             doc = io.BytesIO(log_content.encode('utf-8'))
             doc.name = f"Rebuild_Logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            await bot.send_document(chat_id=chat_id, document=doc, caption="گزارش خام عملیات بازسازی")
+            await bot.send_document(chat_id=chat_id, document=doc, caption="📜 گزارش خام عملیات بازسازی")
 
 async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -418,20 +434,20 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if query.data == 'admin_stats':
         keys = await redis_client.keys("snappfood:token:*")
-        await query.edit_message_text(f"آمار پایگاه داده:\nمجموع رکوردهای فعال: {len(keys)}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data='admin_back')]]))
+        await query.edit_message_text(f"📊 **آمار پایگاه داده:**\nمجموع رکوردهای فعال: `{len(keys)}`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data='admin_back')]]), parse_mode='Markdown')
     
     elif query.data == 'admin_backup_json':
-        await query.message.reply_text("در حال آماده‌سازی فایل پشتیبان...")
+        await query.message.reply_text("⏳ در حال آماده‌سازی فایل پشتیبان...")
         keys = await redis_client.keys("snappfood:token:*")
         all_data = []
         for k in keys:
             all_data.append(json.loads(await redis_client.get(k)))
         doc = io.BytesIO(json.dumps(all_data, ensure_ascii=False, indent=4).encode('utf-8'))
         doc.name = f"Backup_Full_{datetime.now().strftime('%Y%m%d')}.json"
-        await query.message.reply_document(doc, caption="فایل پشتیبان پایگاه داده")
+        await query.message.reply_document(doc, caption="📥 فایل پشتیبان پایگاه داده")
     
-    elif query.data == 'admin_extract_links':
-        await query.message.reply_text("در حال استخراج اطلاعات...")
+    elif query.data == 'admin_links_txt':
+        await query.message.reply_text("⏳ در حال استخراج اطلاعات...")
         keys = await redis_client.keys("snappfood:token:*")
         content = ""
         for k in keys:
@@ -439,24 +455,24 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             content += f"{data.get('phone_number', 'unknown')}: {data.get('short_link', 'بدون مقدار')}\n"
         doc = io.BytesIO(content.encode('utf-8'))
         doc.name = f"Extracted_Links_{datetime.now().strftime('%Y%m%d')}.txt"
-        await query.message.reply_document(doc, caption="گزارش آدرس‌های استخراج شده")
+        await query.message.reply_document(doc, caption="📋 گزارش آدرس‌های استخراج شده")
 
     elif query.data == 'admin_rebuild':
         if rebuild_lock.locked():
-            await query.message.reply_text("سیستم در حال پردازش درخواست دیگری است.")
+            await query.message.reply_text("⚠️ سیستم در حال پردازش درخواست دیگری است.")
         else:
             asyncio.create_task(process_database_rebuild(query.message.chat_id, context.bot))
-            await query.message.reply_text("درخواست بازسازی در پس‌زمینه ثبت گردید.")
+            await query.message.reply_text("✅ درخواست بازسازی در پس‌زمینه ثبت گردید.")
 
-    elif query.data == 'admin_ask_delete':
+    elif query.data == 'admin_delete_prompt':
         await query.edit_message_text(
-            "جهت حذف رکورد، شماره تلفن مربوطه را وارد نمایید:",
+            "🗑 جهت حذف رکورد، شماره تلفن مربوطه را وارد نمایید:",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("لغو", callback_data='admin_cancel')]])
         )
         return ADMIN_ASK_DELETE
 
     elif query.data == 'admin_back' or query.data == 'admin_cancel':
-        await query.edit_message_text("پنل مدیریت سیستم\nلطفا عملیات مورد نظر را انتخاب نمایید:", reply_markup=get_admin_keyboard())
+        await query.edit_message_text("⚙️ **پنل مدیریت سیستم**\nلطفا عملیات مورد نظر را انتخاب نمایید:", reply_markup=get_admin_keyboard(), parse_mode='Markdown')
         if query.data == 'admin_cancel':
             return ConversationHandler.END
 
@@ -467,9 +483,9 @@ async def admin_delete_number(update: Update, context: ContextTypes.DEFAULT_TYPE
     if redis_client:
         deleted = await redis_client.delete(f"snappfood:token:{phone}")
         if deleted:
-            await update.message.reply_text(f"رکورد مرتبط با {phone} حذف گردید.\n\nبازگشت به منوی اصلی:", reply_markup=get_admin_keyboard())
+            await update.message.reply_text(f"✅ رکورد مرتبط با `{phone}` حذف گردید.\n\nبازگشت به منوی اصلی:", reply_markup=get_admin_keyboard(), parse_mode='Markdown')
         else:
-            await update.message.reply_text("رکوردی با مشخصات ارائه شده یافت نشد.\n\nبازگشت به منوی اصلی:", reply_markup=get_admin_keyboard())
+            await update.message.reply_text("⚠️ رکوردی با مشخصات ارائه شده یافت نشد.\n\nبازگشت به منوی اصلی:", reply_markup=get_admin_keyboard())
     return ConversationHandler.END
 
 def main() -> None:
