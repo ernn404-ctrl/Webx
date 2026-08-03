@@ -2,19 +2,16 @@
 import logging
 import json
 import requests
-import random
 import os
 import uuid
 import asyncio
 import redis
 import io
 import time
-import base64
-import cloudscraper
 import urllib3
 from datetime import datetime
 from typing import Optional
-from nacl.public import PublicKey, SealedBox
+from curl_cffi import requests as cffi_requests
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -69,90 +66,73 @@ BASE_HEADERS = {
     'content-type': 'application/json',
     'origin': 'https://snappfood.ir',
     'referer': 'https://snappfood.ir/',
-    'user-agent': 'Mozilla/5.0 (Linux; Android 10)'
+    'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36'
 }
 
-# ================= سیستم رمزنگاری و بای‌پَس پیشرفته اسنپ‌فود =================
-SERVER_PUBLIC_KEY_B64 = "eUhcujcdUs07+XAa6jPweavHMp26he6HCfowMUlaI08="
-try:
-    server_public_key_bytes = base64.b64decode(SERVER_PUBLIC_KEY_B64)
-    server_public_key = PublicKey(server_public_key_bytes)
-except Exception as e:
-    logger.error(f"🔴 خطای رمزنگاری کلید عمومی: {e}")
-    server_public_key = None
+# ======================== سیستم رفرش توکن کوتاه (یکبار مصرف) ========================
 
-
-def seal_data_with_sodium(data_dict: dict) -> str:
-    """رمزنگاری بدنه درخواست دقیقاً مشابه اپلیکیشن موبایل اسنپ‌فود"""
-    json_string = json.dumps(data_dict).encode('utf-8')
-    sealed_box = SealedBox(server_public_key)
-    return base64.b64encode(sealed_box.encrypt(json_string)).decode('utf-8')
-
-
-def refresh_snappfood_token_advanced(current_refresh_token: str, device_uid: str) -> dict:
-    """دریافت توکن جدید با استفاده از متد رمزنگاری و CloudScraper + پروکسی ایرانی.
-    
-    نکته مهم: device_uid باید همان مقداری باشد که هنگام ثبت اولیه استفاده شده،
-    در غیر این صورت سرور اسنپ‌فود درخواست را رد می‌کند.
+def refresh_short_token(short_refresh_token: str) -> dict:
     """
-    if not server_public_key:
-        return {'status': False, 'error': 'کلید رمزنگاری بارگذاری نشد'}
+    بازسازی توکن با استفاده از توکن‌های کوتاه یکبار مصرف.
+    اندپوینت: https://user.snappfood.ir/v1/auth/token
+    روش: curl_cffi با impersonate chrome برای عبور از کلودفلر
+    """
+    device_uid = str(uuid.uuid4())
 
-    TOKEN_ENDPOINT_URL = "https://snappfood.ir/oauth2/default/token"
+    headers = {
+        'authority': 'user.snappfood.ir',
+        'accept': 'application/json, text/plain, */*',
+        'accept-language': 'fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7',
+        'content-type': 'application/json',
+        'origin': 'https://snappfood.ir',
+        'referer': 'https://snappfood.ir/',
+        'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36'
+    }
 
-    scraper = cloudscraper.create_scraper(
-        browser={'browser': 'chrome', 'platform': 'android', 'desktop': False}
-    )
-
-    with scraper as session:
-        # اعمال پروکسی ایرانی — ضروری برای دسترسی از خارج از ایران
-        if IRAN_PROXY:
-            session.proxies.update({"http": IRAN_PROXY, "https": IRAN_PROXY})
-            session.trust_env = False  # جلوگیری از بازنویسی پروکسی توسط محیط
-
-        session.headers.update({
-            "x-is-bonyan": "true",
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10)",
-            "Origin": "https://m.snappfood.ir"
-        })
-
-        grant_body = {
+    payload = {
+        "refreshToken": short_refresh_token,
+        "grantType": "RefreshToken",
+        "data": {
             "time": int(time.time()),
-            "device_uid": device_uid,          # همان UUID ثبت اولیه
+            "device_uid": device_uid,
             "client_id": "snappfood_pwa",
             "client_secret": "snappfood_pwa_secret",
-            "scopes": ["mobile_v2", "mobile_v1", "webview"],
-            "grant_type": "refresh_token",
-            "refresh_token": current_refresh_token
+            "scopes": ["mobile_v2", "mobile_v1", "webview"]
         }
+    }
 
-        try:
-            sealed_payload = seal_data_with_sodium(grant_body)
-            res = session.post(
-                TOKEN_ENDPOINT_URL,
-                json={"data": sealed_payload},
-                timeout=25
-            )
+    try:
+        res = cffi_requests.post(
+            "https://user.snappfood.ir/v1/auth/token",
+            json=payload,
+            headers=headers,
+            proxies=SNAPPFOOD_PROXIES,
+            impersonate="chrome116",
+            timeout=20,
+            verify=False
+        )
 
-            if res.status_code == 200:
-                raw = res.json().get("data", {}) or {}
-                # API مقدار را با snake_case برمی‌گرداند (access_token)
-                new_access  = raw.get("access_token")  or raw.get("accessToken")
-                new_refresh = raw.get("refresh_token") or raw.get("refreshToken") or current_refresh_token
-                if new_access:
-                    return {
-                        'status': True,
-                        'data': {
-                            'accessToken':  new_access,
-                            'refreshToken': new_refresh
-                        }
+        if res.status_code == 200:
+            data = res.json().get("data", {}) or {}
+            new_access  = data.get("accessToken")
+            new_refresh = data.get("refreshToken") or short_refresh_token
+            if new_access:
+                return {
+                    'status': True,
+                    'data': {
+                        'accessToken':  new_access,
+                        'refreshToken': new_refresh
                     }
-                return {'status': False, 'error': 'access_token در پاسخ وجود ندارد'}
-            logger.error(f"ریفرش توکن — HTTP {res.status_code}: {res.text[:200]}")
-            return {'status': False, 'error': f"HTTP {res.status_code}"}
-        except Exception as e:
-            logger.error(f"خطای ریفرش توکن: {e}")
-            return {'status': False, 'error': str(e)}
+                }
+            return {'status': False, 'error': 'accessToken در پاسخ وجود ندارد'}
+
+        logger.error(f"رفرش توکن کوتاه — HTTP {res.status_code}: {res.text[:200]}")
+        return {'status': False, 'error': f"HTTP {res.status_code}: {res.text[:150]}"}
+
+    except Exception as e:
+        logger.error(f"خطای رفرش توکن کوتاه: {e}")
+        return {'status': False, 'error': str(e)}
+
 # ==============================================================================
 
 
@@ -169,29 +149,48 @@ def send_verification_code(phone_number: str) -> dict:
         return {'status': False, 'error': str(e)}
 
 
-def verify_code(phone_number: str, code: str, device_uid: str) -> dict:
-    """تأیید کد OTP — device_uid باید ذخیره و هنگام رفرش توکن دوباره استفاده شود."""
+def verify_code_otp(phone_number: str, code: str, device_uid: str) -> dict:
+    """تأیید کد OTP — فقط تأیید، بدون ثبت‌نام خودکار."""
     url = "https://user.snappfood.ir/v1/auth/token"
     payload = {
-        "cellphone": phone_number, "otpCode": int(code), "grantType": "Otp",
+        "cellphone": phone_number,
+        "otpCode": int(code),
+        "grantType": "Otp",
         "data": {
-            "time": int(datetime.now().timestamp()), "device_uid": device_uid,
-            "client_id": "snappfood_pwa", "client_secret": "snappfood_pwa_secret",
+            "time": int(datetime.now().timestamp()),
+            "device_uid": device_uid,
+            "client_id": "snappfood_pwa",
+            "client_secret": "snappfood_pwa_secret",
             "scopes": ["mobile_v2", "mobile_v1", "webview"]
         }
     }
     try:
         response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, verify=False, timeout=15)
-        data = response.json()
-        data_inner = data.get('data', {}) or {}
-        if not (data.get('status') or data.get('success')) and 'accessToken' not in data_inner:
-            first_names = ["علی", "محمد", "یوسف", "امیر", "حسین", "رضا", "مهدی"]
-            last_names = ["راد", "تهرانی", "حسینی", "پارسا", "دانش", "آریا"]
-            payload["firstName"] = random.choice(first_names)
-            payload["lastName"] = random.choice(last_names)
-            response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, verify=False, timeout=15)
-            data = response.json()
-        return data
+        return response.json()
+    except Exception as e:
+        return {'status': False, 'error': str(e)}
+
+
+def register_new_user(phone_number: str, code: str, device_uid: str, first_name: str, last_name: str) -> dict:
+    """ثبت‌نام کاربر جدید با نام و نام خانوادگی واقعی."""
+    url = "https://user.snappfood.ir/v1/auth/token"
+    payload = {
+        "cellphone": phone_number,
+        "otpCode": int(code),
+        "grantType": "Otp",
+        "firstName": first_name,
+        "lastName": last_name,
+        "data": {
+            "time": int(datetime.now().timestamp()),
+            "device_uid": device_uid,
+            "client_id": "snappfood_pwa",
+            "client_secret": "snappfood_pwa_secret",
+            "scopes": ["mobile_v2", "mobile_v1", "webview"]
+        }
+    }
+    try:
+        response = requests.post(url, json=payload, headers=BASE_HEADERS, proxies=SNAPPFOOD_PROXIES, verify=False, timeout=15)
+        return response.json()
     except Exception as e:
         return {'status': False, 'error': str(e)}
 
@@ -199,6 +198,7 @@ def verify_code(phone_number: str, code: str, device_uid: str) -> dict:
 async def shorten_url_shortio(long_url: str, domain: str, api_key: str, phone_number: str) -> Optional[str]:
     if not api_key or not domain:
         return None
+    import random
     api_url = "https://api.short.io/links"
     custom_path = f"{LINK_CUSTOM_PREFIX}-{phone_number}"
     payload = {"originalURL": long_url, "domain": domain, "path": custom_path}
@@ -231,28 +231,28 @@ def kb_resend_cancel() -> InlineKeyboardMarkup:
 
 def kb_next_or_finish() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕  ثبت شماره جدید",      callback_data='next_line')],
+        [InlineKeyboardButton("➕  ثبت شماره جدید",        callback_data='next_line')],
         [InlineKeyboardButton("✅  پایان و دریافت لینک‌ها", callback_data='finish_session')],
-        [InlineKeyboardButton("🚫  لغو عملیات",           callback_data='cancel')]
+        [InlineKeyboardButton("🚫  لغو عملیات",             callback_data='cancel')]
     ])
 
 
 def kb_admin_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊  آمار دیتابیس",         callback_data='admin_stats'),
-         InlineKeyboardButton("🔄  بازسازی لینک‌ها",       callback_data='admin_rebuild')],
-        [InlineKeyboardButton("📥  استخراج فایل بکاپ",    callback_data='admin_extract')],
-        [InlineKeyboardButton("🗑  حذف شماره",             callback_data='admin_delete_hint')]
+        [InlineKeyboardButton("📊  آمار دیتابیس",        callback_data='admin_stats'),
+         InlineKeyboardButton("🔄  بازسازی لینک‌ها",      callback_data='admin_rebuild')],
+        [InlineKeyboardButton("📥  استخراج فایل بکاپ",   callback_data='admin_extract')],
+        [InlineKeyboardButton("🗑  حذف شماره",            callback_data='admin_delete_hint')]
     ])
 
 
 def kb_back_to_admin() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙  بازگشت به پنل",         callback_data='admin_back')]
+        [InlineKeyboardButton("🔙  بازگشت به پنل",        callback_data='admin_back')]
     ])
 
-
 # =================================================================
+
 
 # --- تابع لغو ---
 async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -271,7 +271,7 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 # --- وضعیت‌های مکالمه ---
-ASK_PHONE, ASK_CODE, ASK_NEXT_ACTION = range(3)
+ASK_PHONE, ASK_CODE, ASK_NAME, ASK_NEXT_ACTION = range(4)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -392,68 +392,151 @@ async def ask_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ASK_CODE
 
-    wait_msg = await update.message.reply_text("⏳  درحال اعتبارسنجی کد و ایجاد لینک...")
+    wait_msg = await update.message.reply_text("⏳  درحال اعتبارسنجی کد...")
 
     # device_uid ثابت به‌ازای هر اکانت — باید ذخیره شود تا هنگام رفرش توکن دوباره استفاده شود
     device_uid = str(uuid.uuid4())
-    res = await asyncio.to_thread(verify_code, phone_number, code, device_uid)
+    context.user_data['device_uid'] = device_uid
+    context.user_data['otp_code'] = code
+
+    res = await asyncio.to_thread(verify_code_otp, phone_number, code, device_uid)
 
     data_dict = res.get('data') or {}
     access_token = data_dict.get('accessToken')
     refresh_token = data_dict.get('refreshToken')
 
+    # ✅ ورود موفق — اکانت قبلاً وجود داشت
     if (res.get('status') or res.get('success')) and access_token:
-        snapp_market_link = (
-            f"https://snapp.market/?source=jek_pwa-food"
-            f"&food_service_design=new&token={access_token}&sso_channel=food"
-        )
-        short_link = await shorten_url_shortio(
-            snapp_market_link, SHORTIO_DOMAIN_EXPRESS, SHORTIO_API_KEY_EXPRESS, phone_number
-        )
-        final_link = short_link if short_link else snapp_market_link
+        await wait_msg.delete()
+        return await _save_and_reply(update, context, phone_number, device_uid, access_token, refresh_token)
 
-        if redis_client:
-            redis_data = {
-                "phone_number": phone_number,
-                "device_uid": device_uid,        # ذخیره device_uid برای رفرش توکن آینده
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "short_link": final_link,
-                "created_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                "updated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-            try:
-                redis_client.set(f"snappfood:token:{phone_number}", json.dumps(redis_data, ensure_ascii=False))
-            except Exception as e:
-                logger.error(f"خطا در ذخیره ردیس: {e}")
-
-        context.user_data['session_links'].append(f"📱 `{phone_number}`\n🔗 {final_link}")
-
-        link_type = "🔗 لینک کوتاه" if short_link else "🔗 لینک مستقیم"
+    # 🆕 کاربر جدید است — نام و نام خانوادگی باید وارد شود
+    needs_registration = (
+        not access_token and
+        not (res.get('status') or res.get('success'))
+    )
+    if needs_registration and not res.get('error'):
         await wait_msg.delete()
         await update.message.reply_text(
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎉  *لینک با موفقیت ساخته شد!*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📱  شماره: `{phone_number}`\n"
-            f"{link_type}: {final_link}\n\n"
-            f"🔽  مرحله بعد را انتخاب کنید:",
-            reply_markup=kb_next_or_finish(),
-            parse_mode='Markdown',
-            disable_web_page_preview=True
-        )
-        return ASK_NEXT_ACTION
-    else:
-        err_msg = res.get('error') or res.get('message') or 'کد نامعتبر یا منقضی شده است.'
-        await wait_msg.delete()
-        await update.message.reply_text(
-            f"⚠️  *خطا در اعتبارسنجی*\n\n"
-            f"جزئیات: `{err_msg}`\n\n"
-            f"کد جدید دریافت کنید یا عملیات را لغو کنید:",
-            reply_markup=kb_resend_cancel(),
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🆕  *اکانت جدید*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "این شماره قبلاً ثبت‌نام نکرده است.\n\n"
+            "👤  لطفاً *نام* و *نام خانوادگی* را وارد کنید:\n"
+            "_(مثال: علی رضایی)_",
+            reply_markup=kb_cancel(),
             parse_mode='Markdown'
         )
-        return ASK_CODE
+        return ASK_NAME
+
+    # ❌ کد اشتباه یا منقضی شده
+    err_msg = res.get('error') or res.get('message') or 'کد نامعتبر یا منقضی شده است.'
+    await wait_msg.delete()
+    await update.message.reply_text(
+        f"⚠️  *خطا در اعتبارسنجی*\n\n"
+        f"جزئیات: `{err_msg}`\n\n"
+        f"کد جدید دریافت کنید یا عملیات را لغو کنید:",
+        reply_markup=kb_resend_cancel(),
+        parse_mode='Markdown'
+    )
+    return ASK_CODE
+
+
+async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """دریافت نام و نام خانوادگی از کاربر برای ثبت‌نام اکانت جدید."""
+    name_input = update.message.text.strip()
+    parts = name_input.split()
+
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "⚠️  لطفاً *نام* و *نام خانوادگی* را با فاصله وارد کنید.\n"
+            "_(مثال: علی رضایی)_",
+            reply_markup=kb_cancel(),
+            parse_mode='Markdown'
+        )
+        return ASK_NAME
+
+    first_name = parts[0]
+    last_name = " ".join(parts[1:])
+
+    phone_number = context.user_data.get('phone_number')
+    device_uid   = context.user_data.get('device_uid')
+    code         = context.user_data.get('otp_code')
+
+    wait_msg = await update.message.reply_text(
+        f"⏳  درحال ثبت‌نام با نام *{first_name} {last_name}* ...",
+        parse_mode='Markdown'
+    )
+
+    res = await asyncio.to_thread(register_new_user, phone_number, code, device_uid, first_name, last_name)
+
+    data_dict    = res.get('data') or {}
+    access_token = data_dict.get('accessToken')
+    refresh_token = data_dict.get('refreshToken')
+
+    if (res.get('status') or res.get('success')) and access_token:
+        await wait_msg.delete()
+        return await _save_and_reply(update, context, phone_number, device_uid, access_token, refresh_token)
+    else:
+        err_msg = res.get('error') or res.get('message') or 'خطا در ثبت‌نام.'
+        await wait_msg.delete()
+        await update.message.reply_text(
+            f"❌  *خطا در ثبت‌نام*\n\n"
+            f"جزئیات: `{err_msg}`\n\n"
+            f"لطفاً /start را مجدداً ارسال کنید.",
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
+
+
+async def _save_and_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    phone_number: str,
+    device_uid: str,
+    access_token: str,
+    refresh_token: str
+) -> int:
+    """ذخیره توکن در ردیس، ساخت لینک و ارسال پاسخ."""
+    snapp_market_link = (
+        f"https://snapp.market/?source=jek_pwa-food"
+        f"&food_service_design=new&token={access_token}&sso_channel=food"
+    )
+    short_link = await shorten_url_shortio(
+        snapp_market_link, SHORTIO_DOMAIN_EXPRESS, SHORTIO_API_KEY_EXPRESS, phone_number
+    )
+    final_link = short_link if short_link else snapp_market_link
+
+    if redis_client:
+        redis_data = {
+            "phone_number": phone_number,
+            "device_uid":   device_uid,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "short_link":   final_link,
+            "created_at":   datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "updated_at":   datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        try:
+            redis_client.set(f"snappfood:token:{phone_number}", json.dumps(redis_data, ensure_ascii=False))
+        except Exception as e:
+            logger.error(f"خطا در ذخیره ردیس: {e}")
+
+    context.user_data['session_links'].append(f"📱 `{phone_number}`\n🔗 {final_link}")
+
+    link_type = "🔗 لینک کوتاه" if short_link else "🔗 لینک مستقیم"
+    await update.message.reply_text(
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎉  *لینک با موفقیت ساخته شد!*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📱  شماره: `{phone_number}`\n"
+        f"{link_type}: {final_link}\n\n"
+        f"🔽  مرحله بعد را انتخاب کنید:",
+        reply_markup=kb_next_or_finish(),
+        parse_mode='Markdown',
+        disable_web_page_preview=True
+    )
+    return ASK_NEXT_ACTION
 
 
 async def next_line_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -544,7 +627,7 @@ async def delete_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def process_database_rebuild(chat_id: int, bot):
-    """بازسازی توکن‌ها با رمزنگاری پیشرفته در پس‌زمینه"""
+    """بازسازی توکن‌ها با سیستم رفرش توکن کوتاه در پس‌زمینه."""
     if not redis_client:
         await bot.send_message(chat_id=chat_id, text="❌  دیتابیس ردیس متصل نیست!")
         return
@@ -560,7 +643,7 @@ async def process_database_rebuild(chat_id: int, bot):
         chat_id=chat_id,
         text=(
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔄  *شروع بازسازی پیشرفته*\n"
+            f"🔄  *شروع بازسازی توکن‌ها*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📊  مجموع رکوردها: `{total}`\n"
             f"⏳  لطفاً صبر کنید..."
@@ -577,19 +660,18 @@ async def process_database_rebuild(chat_id: int, bot):
             data = json.loads(raw)
             phone   = data.get("phone_number")
             r_token = data.get("refresh_token")
-            # همان device_uid که هنگام ثبت اولیه ذخیره شد — اگر نبود یک UUID جدید می‌سازیم
-            d_uid   = data.get("device_uid") or str(uuid.uuid4())
 
             if not phone or not r_token:
                 fail_count += 1
                 continue
 
-            res = await asyncio.to_thread(refresh_snappfood_token_advanced, r_token, d_uid)
+            # استفاده از سیستم رفرش توکن کوتاه (یکبار مصرف)
+            res = await asyncio.to_thread(refresh_short_token, r_token)
             new_data_dict = res.get('data') or {}
-            new_access = new_data_dict.get('accessToken')
+            new_access  = new_data_dict.get('accessToken')
             new_refresh = new_data_dict.get('refreshToken')
 
-            if (res.get('status') or res.get('success')) and new_access:
+            if res.get('status') and new_access:
                 long_link = (
                     f"https://snapp.market/?source=jek_pwa-food"
                     f"&food_service_design=new&token={new_access}&sso_channel=food"
@@ -597,14 +679,16 @@ async def process_database_rebuild(chat_id: int, bot):
                 new_short = await shorten_url_shortio(
                     long_link, SHORTIO_DOMAIN_EXPRESS, SHORTIO_API_KEY_EXPRESS, phone
                 )
-                data["access_token"] = new_access
+                data["access_token"]  = new_access
                 data["refresh_token"] = new_refresh or r_token
-                data["short_link"] = new_short or long_link
-                data["updated_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                data["short_link"]    = new_short or long_link
+                data["updated_at"]    = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 redis_client.set(key, json.dumps(data, ensure_ascii=False))
                 success_count += 1
             else:
+                logger.warning(f"رفرش ناموفق برای {phone}: {res.get('error')}")
                 fail_count += 1
+
         except Exception as ex:
             logger.error(f"خطا در بازسازی {key}: {ex}")
             fail_count += 1
@@ -615,7 +699,7 @@ async def process_database_rebuild(chat_id: int, bot):
         chat_id=chat_id,
         text=(
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅  *بازسازی پیشرفته پایان یافت*\n"
+            f"✅  *بازسازی پایان یافت*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📊  مجموع: `{total}`\n"
             f"🟢  موفق: `{success_count}`\n"
@@ -628,13 +712,13 @@ async def process_database_rebuild(chat_id: int, bot):
 
 async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     if not redis_client:
-        await query.message.reply_text("❌  دیتابیس ردیس متصل نیست!")
+        await query.answer("❌ دیتابیس ردیس متصل نیست!", show_alert=True)
         return
 
     if query.data == 'admin_stats':
+        await query.answer()
         keys = redis_client.keys("snappfood:token:*")
         count = len(keys)
         await query.edit_message_text(
@@ -680,6 +764,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif query.data == 'admin_rebuild':
+        await query.answer("عملیات بازسازی شروع شد...")
         await query.edit_message_text(
             "🔄  *عملیات بازسازی در پس‌زمینه آغاز شد...*\n\nبه محض پایان نتیجه ارسال می‌شود.",
             parse_mode='Markdown'
@@ -695,6 +780,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif query.data == 'admin_back':
+        await query.answer()
         db_status = "🟢 متصل" if redis_client else "🔴 قطع"
         record_count = len(redis_client.keys("snappfood:token:*")) if redis_client else 0
         text = (
@@ -706,6 +792,8 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"یک گزینه را انتخاب کنید:"
         )
         await query.edit_message_text(text, reply_markup=kb_admin_main(), parse_mode='Markdown')
+    else:
+        await query.answer()
 
 
 def main() -> None:
@@ -725,12 +813,16 @@ def main() -> None:
             ASK_CODE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_code),
                 CallbackQueryHandler(resend_code_callback, pattern='^resend_code$'),
+                CallbackQueryHandler(cancel_action,         pattern='^cancel$')
+            ],
+            ASK_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name),
                 CallbackQueryHandler(cancel_action, pattern='^cancel$')
             ],
             ASK_NEXT_ACTION: [
-                CallbackQueryHandler(next_line_callback,     pattern='^next_line$'),
-                CallbackQueryHandler(finish_session_callback, pattern='^finish_session$'),
-                CallbackQueryHandler(cancel_action,           pattern='^cancel$')
+                CallbackQueryHandler(next_line_callback,      pattern='^next_line$'),
+                CallbackQueryHandler(finish_session_callback,  pattern='^finish_session$'),
+                CallbackQueryHandler(cancel_action,            pattern='^cancel$')
             ]
         },
         fallbacks=[
