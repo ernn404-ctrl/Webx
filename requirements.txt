@@ -4,3 +4,4 @@ redis
 cloudscraper
 PyNaCl
 aiohttp
+curl_cffi
