@@ -242,6 +242,7 @@ def kb_admin_main() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊  آمار دیتابیس",        callback_data='admin_stats'),
          InlineKeyboardButton("🔄  بازسازی لینک‌ها",      callback_data='admin_rebuild')],
         [InlineKeyboardButton("📥  استخراج فایل بکاپ",   callback_data='admin_extract')],
+        [InlineKeyboardButton("🔑  استخراج توکن‌ها",      callback_data='admin_extract_tokens')],
         [InlineKeyboardButton("🗑  حذف شماره",            callback_data='admin_delete_hint')]
     ])
 
@@ -763,6 +764,45 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
 
+    elif query.data == 'admin_extract_tokens':
+        keys = redis_client.keys("snappfood:token:*")
+        if not keys:
+            await query.answer("⚠️ دیتابیس خالی است!", show_alert=True)
+            return
+
+        await query.answer("درحال آماده‌سازی فایل توکن‌ها...")
+        lines = [
+            "لیست توکن‌ها و رفرش توکن‌ها",
+            f"تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "=" * 60,
+            ""
+        ]
+        for k in keys:
+            try:
+                data = json.loads(redis_client.get(k))
+                lines.append(f"شماره:         {data.get('phone_number', 'نامشخص')}")
+                lines.append(f"Access Token:  {data.get('access_token', 'ندارد')}")
+                lines.append(f"Refresh Token: {data.get('refresh_token', 'ندارد')}")
+                lines.append(f"آخرین بروزرسانی: {data.get('updated_at', 'نامشخص')}")
+                lines.append("-" * 60)
+            except Exception:
+                continue
+
+        content = "\n".join(lines)
+        doc = io.BytesIO(content.encode('utf-8'))
+        doc.seek(0)
+        doc.name = f"Tokens_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+        await query.message.reply_document(
+            doc,
+            caption=(
+                f"🔑  *فایل توکن‌ها*\n"
+                f"📊  تعداد رکوردها: `{len(keys)}`\n"
+                f"🕐  زمان: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+                f"⚠️  این فایل حساس است. مراقب باشید."
+            ),
+            parse_mode='Markdown'
+        )
+
     elif query.data == 'admin_rebuild':
         await query.answer("عملیات بازسازی شروع شد...")
         await query.edit_message_text(
@@ -844,4 +884,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
